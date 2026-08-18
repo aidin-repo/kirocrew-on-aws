@@ -1,83 +1,41 @@
-# Every bug was at a seam
+# Run an AI agent workspace 24/7 in your own AWS account
 
-## Running an agent workspace 24/7 on AWS, and the six failures that taught me something
+[Kiro Crew](https://kiro.dev/crew/) is a persistent agent workspace. It runs cron jobs, drives long
+tasks, holds Slack and Discord connections, and accumulates memory across sessions. All of that only
+works while the Gateway process is up, which makes a laptop an awkward host: close the lid and your
+scheduled jobs stop and your integrations drop.
 
-I spent a day putting [Kiro Crew](https://kiro.dev/crew/) on AWS so it runs continuously instead
-of dying when my laptop sleeps. The infrastructure was the easy part. What took the day was six
-failures, and they had something in common that I did not expect.
+This post walks through deploying that Gateway into your own AWS account as a single CloudFormation
+stack, so it runs continuously and heals itself when the host goes away. All durable state lives in
+Amazon S3, so the EC2 instance is disposable: a replacement resumes your memories, conversations,
+crons and skills, and comes back already signed in.
 
-None of them were in a component. Every single one was at a **seam** — a place where two
-independently correct designs met and produced a behaviour neither one was wrong about.
+The template is 82 resources. `cfn-lint` and the AWS CLI are the only tools you need. Everything here
+has been deployed and exercised against a live account.
 
-That is the interesting thing, so it is what this post is about. The CloudFormation is in
-[the repository](#the-repository); I will not walk through it line by line.
+**Repository: [github.com/aidin-repo/kirocrew-on-aws](https://github.com/aidin-repo/kirocrew-on-aws)**
 
----
+## What you can do with it
 
-## Why run it remotely at all
+**Scheduled agent work.** A nightly dependency-and-CVE sweep across your repositories. A morning
+digest of issues and pull requests waiting on you. A recurring report that reads one system and
+writes to another. Cron jobs need a host that is awake at 3am.
 
-Crew is a persistent workspace, not a chat window. It runs cron jobs, drives long tasks, holds
-Slack and Discord connections, and accumulates memory across sessions. All of that only works
-while the gateway process is running, which makes a laptop a poor host: close the lid and your
-scheduled jobs stop, your integrations drop, and the agent's continuity is only as good as your
-uptime.
+**Long tasks you start and walk away from.** A migration across dozens of files, a refactor with a
+test loop, a backlog of small fixes. Kick it off from your phone, close the laptop, read the result
+later.
 
-So: put it on an always-on host. Which raises the actual design question — if the host is going
-to be disposable, where does the state live?
+**Chat-driven operations.** With Slack or Discord connected, a team talks to one Crew instance that
+keeps its memory across conversations, instead of everyone running a separate short-lived agent.
 
-## The state question, and what I measured
+**A shared team workspace.** Memory, lessons and skills accumulate in one place. Amazon Cognito
+controls who reaches the dashboard, and an owner tag lets you run more than one Gateway in the same
+account.
 
-Crew keeps everything in a data home: SQLite databases for memory, conversation history, cron
-definitions, skills, an embedding model. My first instinct was the obvious one — EBS volume,
-periodic sync to S3. It is also the wrong shape, because it makes the host semi-precious: lose
-it between syncs and you lose whatever was not synced.
+**Private deployment for sensitive work.** Everything sits in your account, in private subnets, with
+conversation content in a bucket encrypted by a customer-managed KMS key.
 
-The alternative was to put the data home directly on S3 through a filesystem mount, making the
-compute genuinely stateless. The obvious objection is SQLite. SQLite over a network filesystem
-has a long history of corruption, and Crew uses WAL mode.
-
-So I did not argue about it. I ran a spike and measured:
-
-| Check | Result |
-|---|---|
-| `PRAGMA integrity_check` on both databases, on the mount | `ok` |
-| Same, after stop/start of the container | `ok` |
-| Same, after three *ungraceful* host replacements | `ok` |
-| Sentinel file ETag across all replacements | byte-identical |
-| Object versions created per 6 hours idle | 33 |
-| Object versions created per host rebuild | 157 |
-
-Two things fell out of that which I would not have predicted.
-
-**Churn is dominated by rebuilds, not by running.** 157 versions per replacement against 33 per
-six idle hours means a noncurrent-version lifecycle policy should be sized against how often you
-rebuild, not how long you run.
-
-**The recovery point is about a minute, not zero.** I had written "zero RPO" in my design because
-the data is *on* S3. Then I measured export age and got 66 seconds. The filesystem exports
-asynchronously, so a write is durable in the filesystem before it is an object in the bucket.
-That is a perfectly reasonable design and it makes "the data is in S3" a claim about steady
-state, not about the last second before a crash. I corrected the design document.
-
-That is the mundane version of the seam problem: the filesystem is correct, S3 is correct, and my
-inference across the boundary was wrong.
-
-## What I did not build, and why
-
-**Not Fargate.** Two reasons, both disqualifying. ECS deletes the task's volume when the task
-stops, so the disposable-host property becomes a data-loss property. And Crew isolates each agent
-subprocess in a user namespace, which needs kernel capabilities a Fargate task does not get.
-
-**Not AgentCore Runtime.** It is a good fit for invocation-scoped agents and a bad fit for this.
-There is no persistent HTTP surface to put a load balancer in front of, and the lifecycle is
-scoped to invocations with idle termination. Crew's whole value here is that it is *up* when
-nothing is calling it — that is what makes the cron jobs fire.
-
-So: EC2, Docker, systemd. Unfashionable and correct. Graviton4, 2 vCPU, 16 GiB — chosen on
-price-performance rather than lowest price, and sized by memory because Crew scales subagent
-concurrency by available memory rather than by core count.
-
-## The architecture, briefly
+## Solution overview
 
 ```mermaid
 flowchart LR
@@ -147,257 +105,288 @@ flowchart LR
     class cw,sns obs
 ```
 
-Two access modes. `front-door` builds the top path and needs a registered domain. `ssm-only`
-builds none of it — no CloudFront, no ALB, no WAF, no Cognito, no certificate — and you reach the
-dashboard over a forwarded port. The second mode exists because the first has a hard prerequisite
-that no amount of cleverness removes: an ALB can only do Cognito authentication on an HTTPS
-listener, that listener needs a certificate matching the host, and ACM will not issue a
-certificate for a `cloudfront.net` name.
+The Gateway runs as a Docker container under systemd on a Graviton instance in a private subnet. Its
+data home is an S3-backed filesystem mounted over NFS, so memories, conversations, cron definitions,
+skills and the signed-in CLI credential store all live in a versioned S3 bucket instead of on the
+instance.
 
----
+Boot is four systemd units in order:
 
-## The six seams
+1. `crew-mount.service` — mount the S3-backed data home.
+2. `crew-secrets.service` — fetch secrets from AWS Secrets Manager using the instance role.
+3. `crew-gateway.service` — start the container, listening on port 5476.
+4. `crew-health.timer` — publish three CloudWatch metrics on a schedule.
 
-### 1. A load balancer that is also an HTTP client
+Because nothing durable sits on the instance, an Auto Scaling group can replace it freely. The group
+is fixed at one instance — the data home is SQLite, so a second writer is not safe — and exists only
+to self-heal, never to scale.
 
-Sign-in worked. Cognito accepted the password, redirected back with an authorization code, and
-the browser got **500**.
+### Two access modes
 
-The ALB access log named it immediately once I had access logs — more on that shortly:
+**`front-door`** builds a public HTTPS entry point on your own domain: Route 53 to AWS WAF to
+CloudFront to an internal Application Load Balancer that performs Cognito authentication, then to the
+Gateway. Three layers guard it — WAF and CloudFront, then Cognito, then Crew's own minted session
+token. Cognito is additive; it never replaces Crew's token.
 
-```
-500  GET /oauth2/idpresponse?code=...  target=-  error_reason="AuthTokenEpRequestTimeout"
-```
+**`ssm-only`** builds none of that. No CloudFront, no ALB, no WAF, no Cognito, no certificate, no
+domain requirement. The host security group has no inbound rule at all, and you reach the dashboard
+by forwarding a port over AWS Systems Manager. This is the default and the cheapest useful shape.
 
-`target=-` means the request never reached the application. The load balancer failed by itself.
+`front-door` exists for phone and browser access from anywhere. It has a hard prerequisite: an ALB can
+only do Cognito authentication on an HTTPS listener, that listener needs a certificate matching the
+host CloudFront forwards, and ACM will not issue a certificate for a `cloudfront.net` name. So a
+registered domain is required, with no workaround.
 
-Here is the seam. `authenticate-cognito` makes the ALB an HTTP **client**: it calls the Cognito
-token endpoint server-side to exchange that code. I had given its security group exactly one
-egress rule, to the target group on the application port — which is textbook least privilege for
-a load balancer, because a load balancer talks to its targets and nothing else.
+## Prerequisites
 
-Both halves are right. A least-privilege egress rule is right. Server-side code exchange is
-right. Together they blackhole the token call, and because the packets are dropped rather than
-refused, the symptom is a five-second hang and a 500 rather than a connection error.
+**The region is us-east-1, and it is not a parameter.** CloudFront's viewer certificate and a
+`CLOUDFRONT`-scoped WAF web ACL can only exist there. The template asserts this and fails fast.
 
-It cannot even be narrowed: the hosted UI lives on a public endpoint with no prefix list, and the
-interface endpoint for the Cognito API does not serve the `/oauth2/*` routes. The fix is egress
-on 443 to `0.0.0.0/0`, which looks careless in a review and is in fact required.
+On your machine:
 
-### 2. A rebinding defence that has never heard of your domain
+| Requirement | Notes |
+|---|---|
+| AWS CLI v2 | Recent enough to include `s3files`. The scripts fall back to boto3, so an older CLI works if botocore is current. |
+| `cfn-lint` | `pip install cfn-lint`. The deploy script refuses to run without it. |
+| Python 3 | Used by the scripts for JSON and CIDR arithmetic. |
+| `gh`, authenticated | Only for image verification. Docker is not required. |
+| Credentials that can create IAM roles | The stack creates two IAM roles, two KMS keys, Cognito, CloudFront and WAF. |
 
-With the 500 fixed, every request became **403 Host header not allowed**.
+If you reuse an existing VPC, it needs two private subnets in distinct Availability Zones, both with
+a default route to a NAT or transit gateway, and DNS hostnames and DNS resolution both enabled. The
+deploy script verifies all of this before creating anything.
 
-Crew runs a DNS-rebinding barrier: the `Host` header must name a host it actually serves, derived
-from its CSRF origin allowlist. Correct, and a defence I want. But behind CloudFront the header
-names *my* domain, which Crew has no reason to trust.
+If you want `front-door`, you also need a registered domain, a Route 53 public hosted zone for it in
+the same account, and one ACM certificate in us-east-1 with status `ISSUED` covering that domain.
+Because the region is pinned, that single certificate serves both the CloudFront viewer connection
+and the ALB listener.
 
-Same shape as the first: a barrier that is right, a CDN that is right, and a seam where the
-identity of "the host" differs on each side. Declaring the origin fixes it.
+## Walkthrough
 
-### 3. A dashboard that works perfectly and cannot do any work
+### Step 1 — Verify the container image
 
-This one is the reason I am writing the post.
+Resolve the image to an immutable digest and check its SLSA build provenance before you run it:
 
-After the 403, the dashboard loaded. It looked completely healthy. And in the logs, on repeat:
-
-```
-SandboxUnavailableError: unshare(CLONE_NEWUSER) failed with errno 1 (EPERM).
-Running inside a Docker/OCI container where the runtime's seccomp or AppArmor
-policy blocks user namespace creation.
-```
-
-Crew isolates each agent subprocess in a user namespace. Docker's **default** seccomp profile
-denies `unshare(CLONE_NEWUSER)`. So the web tier serves happily while every agent turn fails —
-the worst possible split, because the part you look at works.
-
-Docker's default profile is a good default. A user-namespace sandbox is a good isolation
-mechanism. The seam is that the sandbox needs precisely the syscall the default profile blocks.
-
-The tempting fix is the environment variable that turns the sandbox off. I did not take it: this
-host holds an IAM role with access to the state bucket, so the container must not be the only
-boundary around agent-authored code. Upstream ships a seccomp profile that is the Docker default
-plus unconditional `unshare`/`clone`/`mount` allows, still `defaultAction: SCMP_ACT_ERRNO`. Boot
-fetches it, verifies it against a pinned SHA256, and refuses to start on mismatch.
-
-### 4. The security control that hid the credential it needed
-
-And then the best one.
-
-With the sandbox working, the setup gate said **"Sign in to Kiro — Required"** and would not
-clear. Except sign-in was fine:
-
-```
-$ docker exec crew kiro-cli whoami
-Logged in with IAM Identity Center
-Email: ...
-Profile: arn:aws:codewhisperer:...:profile/...
-
-$ docker exec crew kiro-cli login --use-device-flow --license pro
-error: Already logged in, please logout first
+```bash
+git clone https://github.com/aidin-repo/kirocrew-on-aws.git && cd kirocrew-on-aws
+scripts/verify-image.sh stable
 ```
 
-Authenticated by every check I could run from a shell. The gateway's own probe disagreed, and the
-status endpoint reported `authenticated: false` with — and this is the part that cost me the most
-time — **`sandbox_unavailable: false`** and no error anywhere. Nothing was broken. Restarting
-changed nothing.
+The script talks to the registry API directly with an anonymous pull token, so no container runtime
+is needed. It prints the multi-arch index digest on stdout — pin that value, not a per-architecture
+digest, so one parameter works on Graviton and x86 alike.
 
-I got this wrong five times before I read the code. I guessed the sandbox was still failing
-(the JSON said otherwise). I guessed NFS UID remapping, since a user namespace changes the UID on
-the wire and the server judges access by it — plausible, and disproved in one command. I guessed
-the 10-second probe timeout, and `whoami` returned in 1.045 seconds. I guessed a stale readiness
-latch from boot, and a restart disproved it. I guessed the probe environment stripped `HOME`, and
-it is on the allowlist and matches.
+### Step 2 — Fill in your parameters
 
-Then I stopped guessing and read what the probe actually does:
-
-```python
-self._crew_hidden_dirs = tuple(dict.fromkeys(
-    str(path) for path in (
-        self._data_home,                 # ← this
-        self._home / ".kiro" / "crew",
-        self._home / ".kirocrew",
-    )))
+```bash
+cp infra/params.example.json infra/params.json
+$EDITOR infra/params.json
 ```
 
-Crew hides its own data home from the CLI it probes, and from every agent session, so an agent
-cannot read Crew's secrets. Unambiguously correct.
+The example file documents every parameter inline. The ones that matter most:
 
-Upstream assumes the data home and the credential store are different trees: Crew in
-`~/.kiro/crew/`, the CLI's credentials in `~/.local/share/kiro-cli/`. Hide one, the other stays
-visible. The code comment says so explicitly — the readiness probe "must leave those visible … so
-a CLI whose valid session lives outside the staged files can read its own credentials."
+| Parameter | Default | Notes |
+|---|---|---|
+| `AccessMode` | `ssm-only` | `front-door` requires a domain and one ACM cert |
+| `NetworkMode` | `existing` | `existing` reuses your VPC and NAT, usually at no extra cost |
+| `VpcId`, `PrivateSubnetIds` | — | Two private subnets in distinct AZs |
+| `DomainName`, `HostedZoneId`, `CertificateArn` | — | Required for `front-door` |
+| `InstanceType` | `r8g.large` | Graviton4, 2 vCPU / 16 GiB. Subagent concurrency scales with memory, so `r8g.xlarge` is the lever for wider fan-out |
+| `MfaMode` | `ON` | Only weaken deliberately: this is a public endpoint fronting a shell-capable agent |
+| `ContainerImageDigest` | pinned | The value from step 1 |
+| `NotificationEmail` | — | Alarm destination |
+| `OwnerTag` | `kirocrew` | Distinguishes multiple Gateways in one account |
 
-I had set the data home to the **whole home directory**, because the entire home was the S3
-mount and that seemed tidy. So the hide covered `$HOME`, and took the credential store with it.
+`infra/params.json` is gitignored. Do not commit it.
 
-Two correct security designs. A sandbox that hides secrets from agents, and a filesystem mounted
-at `$HOME`. Composed, they make a valid credential invisible to the one process that must read
-it — and report it as "not signed in", with no error, no failed check, and a sandbox that
-correctly says it is available. It was doing its job perfectly.
+### Step 3 — Validate without creating anything
 
-The fix moves the credential store to a different **container path** on the same storage, so it
-persists in S3 but sits outside the hidden tree. No data migration.
-
-Worth noting what would have happened if I had only cared about the setup gate: agent sessions
-run the CLI under the same sandbox with the same hidden paths, so every conversation would have
-failed for the identical reason. The gate was not the bug. It was the first thing to notice it.
-
-### 5. An Auto Scaling group that cannot use your own key
-
-Converting the standalone instance to a single-instance ASG so the host self-heals, every launch
-died with:
-
-```
-Client.InvalidKMSKey.InvalidState: The KMS key provided is in an incorrect state
+```bash
+scripts/deploy.sh --params infra/params.json --validate-only
 ```
 
-The key was `Enabled` and healthy. The state is fine; the problem is authorization. An ASG
-provisions EBS through a service-linked role, and that role's AWS-managed identity policy does
-not convey use of a **customer** key — only a key policy statement does. A standalone instance
-never hits this, because it launches with your credentials.
+This runs the pre-flight checks that CloudFormation cannot: subnet egress routes, distinct
+Availability Zones, VPC DNS settings, S3 Files availability in the account, certificate status, and
+whether any other security group in the VPC admits your Crew subnets by CIDR. Each check that fails
+names the offending resource.
 
-The seam is between "customer-managed keys are more controlled" and "the ASG acts on your behalf
-through its own principal". And the failure mode is worse than the message: an ASG retries
-indefinitely, so the stack sat in `UPDATE_IN_PROGRESS` for an hour before rolling back, rather
-than failing in thirty seconds.
+One honest caveat: the template is 77 KB, past CloudFormation's 51,200-byte inline limit, so
+validation has to happen from S3. The script creates a private encrypted staging bucket if one is
+absent and uploads the template. No stack and no Crew infrastructure is created.
 
-Which raised a better question: why is the *root volume* encrypted with a customer key at all? It
-carries `DeleteOnTermination`, the data home is on S3, and the AWS-managed key encrypts at rest
-identically. That use bought an hour of debugging for no security gain. Keep the customer key
-where it earns its place — the bucket holding conversation content, where a key policy can
-express something the managed key cannot — and use the managed key where it does not.
+### Step 4 — Deploy
 
-### 6. An alarm that cannot name the thing it watches
-
-A smaller one that generalises well.
-
-The mount client publishes a bucket-reachability metric with an `InstanceId` dimension. Under an
-ASG there is no stable instance id, so a pinned dimension goes stale on every self-heal. The
-obvious fix is rejected outright:
-
-```
-SEARCH is not supported on Metric Alarms.
+```bash
+scripts/deploy.sh --params infra/params.json
 ```
 
-Alarms need one deterministic series. So the health script now tests bucket reachability directly
-with the instance role and publishes the result with **no dimensions**, which is both stable
-across replacement and a more direct test of the thing worth detecting.
+Add `--stack <name>` to run more than one, `--profile <name>` to pick credentials.
 
-There is a related trap in the same family that I hit earlier and that is worth stating on its
-own, because it wastes an afternoon: **an alarm whose dimensions do not match the published
-metric sits in `INSUFFICIENT_DATA` forever while the metric is plainly visible in the console.**
-`INSUFFICIENT_DATA` on a metric you can see is a dimension mismatch, not a publishing failure.
+### Step 5 — Two things only a human can do
 
----
+The deployment is not usable until both are done.
 
-## Two lessons that are not about AWS
+**Confirm the SNS subscription.** AWS emails `NotificationEmail`. Until you click the link, no alarm
+can reach you.
 
-**Build the observability before the thing it observes can fail.** My design specified ALB access
-logs and container logs to CloudWatch. I skipped both as non-essential and got to the first real
-500 completely blind — guessing at layers instead of reading a log line that would have named the
-cause immediately. The first fix of the day was wiring the logging the design had already
-called for. `AuthTokenEpRequestTimeout` was sitting there waiting.
+**Sign in `kiro-cli` on the host.** There is no fixed instance id under an Auto Scaling group, so
+resolve it first:
 
-**When a hypothesis fails twice, stop generating hypotheses and read the code.** Five wrong
-guesses about the credential problem cost more than reading `_crew_hidden_dirs` would have. Each
-guess was individually reasonable, which is exactly what made the pattern hard to notice — and
-they all shared an assumption I never checked, that something was *broken*. Nothing was broken.
-Every component was working as designed. That class of failure is invisible to "what is broken?"
-and obvious to "what does this actually do?".
+```bash
+ASG=$(aws cloudformation describe-stacks --stack-name kirocrew \
+  --query 'Stacks[0].Outputs[?OutputKey==`AutoScalingGroupName`].OutputValue' --output text)
 
-## What was measured
+INSTANCE=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
+  --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)
 
-Recovery, tested on a live deployment:
+aws ssm start-session --region us-east-1 --target "$INSTANCE"
+```
+
+Then, on the host:
+
+```bash
+sudo docker exec -it crew kiro-cli login --use-device-flow --license pro
+```
+
+Both flags matter. `--use-device-flow` prints a code to enter in your own browser, because a headless
+host has no browser to launch. `--license pro` selects IAM Identity Center rather than a free Builder
+ID. Agent sessions fail until this finishes, and the `GatewayHealthy` alarm fires in the meantime,
+which is expected during bootstrap.
+
+Verify:
+
+```bash
+sudo docker exec crew kirocrew doctor
+```
+
+Expect kiro-cli present and authenticated, config valid, embeddings available.
+
+## Using it
+
+### Open the dashboard
+
+In `front-door` mode, browse to the stack's `DashboardUrl` output. Create your user in the Cognito
+user pool first — self-signup is disabled by design.
+
+In `ssm-only` mode, forward the port and use `localhost:5476`:
+
+```bash
+aws ssm start-session --region us-east-1 --target "$INSTANCE" \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["5476"],"localPortNumber":["5476"]}'
+```
+
+Either way, Crew mints its own session token on the host:
+
+```bash
+sudo docker exec crew kirocrew token --ttl 12h
+```
+
+Mint it immediately before use. The printed URL names `localhost`, so behind the front door you
+substitute your own domain or paste the bare token into the dashboard's banner field.
+
+### Pause it
+
+Scale the group to zero. Do not stop the instance — an Auto Scaling group reads a stopped instance as
+unhealthy and terminates it, so stopping destroys the host rather than pausing it.
+
+```bash
+aws autoscaling set-desired-capacity --auto-scaling-group-name "$ASG" --desired-capacity 0
+aws autoscaling set-desired-capacity --auto-scaling-group-name "$ASG" --desired-capacity 1
+```
+
+### Watch it
+
+A health timer publishes `GatewayHealthy`, `DataHomeReadable` and `BucketAccessible` to the
+`KiroCrew/<stack-name>` namespace, with no dimensions so they stay alarmable across instance
+replacement. Five CloudWatch alarms notify the SNS topic. Container logs go to CloudWatch Logs, ALB
+access logs to the log bucket, and S3 Files publishes `PendingExports` and `ExportFailures` under
+`AWS/S3/Files`.
+
+### Prove the self-healing
+
+`scripts/rebuild-drill.sh` terminates the instance through the Auto Scaling group, times the
+recovery, and asserts data integrity afterwards. Measured on a live deployment:
 
 | Action | Instance | Time to healthy |
 |---|---|---|
 | Reboot | same host kept | under 90s; the ASG does not react |
 | Terminate | replaced automatically | **134s** |
-| Stop | **terminated and replaced** | 237s |
+| Stop | terminated and replaced | 237s |
 
-The third row is a behavioural change worth knowing: an ASG reads a stopped instance as unhealthy
-and terminates it. Stopping the host no longer pauses it — you scale to zero instead.
+Through all three the sentinel file's ETag stayed byte-identical and the kiro-cli credential store
+came through unchanged, so the replacement host resumes already signed in. That is what makes the
+compute genuinely disposable rather than merely rebuildable.
 
-Through all three, the sentinel ETag stayed byte-identical and the CLI credential store came
-through unchanged, so a replacement host resumes **already signed in**. That last property is
-what makes the compute genuinely disposable rather than merely rebuildable.
+One storage detail worth knowing before you rely on a restore: the S3 export is asynchronous, with
+export age measured at about 66 seconds under light load, and a SQLite database is three objects
+(`.db`, `.db-wal`, `.db-shm`) exported independently. Stop the container before taking a restore, so
+SQLite checkpoints and the WAL drains.
 
-## Honest limits
+## Cost
 
-Three, because a post that only lists wins is not useful.
+Magnitudes rather than calculator output:
 
-**The customer-managed key does not currently isolate anything.** Its policy is a single
-delegate-to-IAM statement and the bucket policy only denies non-TLS, so any principal in the
-account with S3 and KMS permissions can read conversation content. Today the key buys rotation
-control, a distinct ARN, and a kill switch — not isolation from my own admin role. Restricting
-decrypt to the instance role is a deliberate next step, and it means locking myself out too.
+| Configuration | Rough monthly |
+|---|---|
+| `ssm-only` + existing VPC | An instance and a bucket. The cheapest useful shape |
+| `ssm-only` + created VPC + NAT instance | Above, plus a few dollars |
+| `front-door` + created VPC + NAT gateway | Above, plus roughly $32 NAT and $16–22 ALB |
 
-**Resource ceilings are not enforced.** The container has no `systemd-run`, so Crew cannot put
-each agent subprocess in its own cgroup scope. The user-namespace isolation works, but there is
-no memory or process-count ceiling — instance memory is the only backstop against a runaway.
+The instance dominates in every case, around $86/month for `r8g.large`, so a Savings Plan is the main
+lever on a 24/7 workload. Two KMS keys add about $2/month, and S3 Bucket Keys keep KMS request charges
+negligible. Scaling to zero removes most of the bill; the ALB, CloudFront and NAT keep charging.
 
-**Availability is one AZ, deliberately.** There is a single filesystem mount target; an instance
-in another AZ cannot reach it and fails closed at the mount unit. An AZ outage is an outage. A
-second mount target would widen it, but with a single-writer SQLite data home that buys faster
-recovery, not redundancy.
+## Security posture
 
-## The repository
+- Instance in a private subnet, no public IP, no key pair, IMDSv2 required with hop limit 1.
+- In `ssm-only` mode, no inbound security-group rule at all.
+- State bucket encrypted with a customer-managed key, versioned, Block Public Access fully on, and
+  non-TLS requests denied.
+- Crew's OS-level agent sandbox stays enabled. The upstream seccomp profile is pinned by SHA256 and
+  boot fails closed on mismatch.
+- Secrets live in Secrets Manager and are fetched by the instance role at boot. No secret value
+  appears in the template, in parameters, in user data, or in any log.
 
-One CloudFormation template, 82 resources. `cfn-lint` and the AWS CLI are the only tools
-required. Both access modes, the pre-flight checks that catch what CloudFormation cannot
-validate, and all six seams above encoded so you do not rediscover them.
+Two limits worth stating plainly. The state key's policy is a single delegate-to-IAM statement, so any
+principal in the account with S3 and KMS permissions can read conversation content — the key buys
+rotation control, a distinct ARN and a kill switch, not isolation from your own admin role. And the
+container has no `systemd-run`, so agent subprocesses get user-namespace isolation but no cgroup
+memory or process-count ceiling; instance memory is the only backstop against a runaway.
 
-A note on the template's size, since it is its own small trap: past **51,200 bytes**
-CloudFormation will not accept a template inline, so it must be staged in S3 first. Which also
-means `--validate-only` is not quite side-effect free at that size — validating a large template
-requires uploading it. The deploy script handles the staging and the README says so plainly,
-because a claim of "creates nothing" that creates a bucket is exactly the kind of small lie that
-erodes trust in the rest of the document.
+Availability is bounded to one Availability Zone on purpose. There is a single S3 Files mount target,
+and an instance launched elsewhere cannot reach it and fails closed at the mount unit. An AZ outage is
+an outage.
+
+## Cleanup
+
+```bash
+aws cloudformation delete-stack --region us-east-1 --stack-name kirocrew
+```
+
+Deleting the stack removes the Auto Scaling group, which terminates the instance. The state bucket and
+the log bucket carry `DeletionPolicy: Retain`, so your data survives and shows as `DELETE_SKIPPED` —
+delete those buckets by hand when you actually mean to. With an existing VPC, the stack never owned
+your network, so neither the VPC nor the NAT is touched.
+
+The same retention applies to a failed create: rollback keeps the bucket, and a later deploy under the
+same stack name collides with it. Delete the leftover bucket or pick a different stack name.
+
+## Conclusion
+
+An always-on Gateway turns Crew from a session you babysit into a workspace that keeps working:
+scheduled jobs fire on time, long tasks finish without you watching, and chat integrations stay
+connected. Holding all durable state in S3 is what makes that affordable to operate, because the host
+stops being precious — you can terminate it, and 134 seconds later everything is back, memory intact
+and still signed in.
+
+The repository has the full template, both access modes, the pre-flight checks, a rebuild drill you
+can run yourself, and a runbook covering day-two operations.
 
 **[github.com/aidin-repo/kirocrew-on-aws](https://github.com/aidin-repo/kirocrew-on-aws)**
 
----
+### Further reading
 
-*If you take one thing from this: the parts I designed carefully all worked. Everything that
-broke, broke where two working things met. Look at your seams.*
+- [Kiro Crew](https://github.com/kirodotdev/KiroCrew) — the project this deploys
+- [Running Crew 24/7](https://kiro.dev/docs/crew/running-24-7/) — upstream guidance on remote hosts
+- [Crew security model](https://kiro.dev/docs/crew/security/) — the layers this deployment relies on
