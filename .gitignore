@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------- your values
+# Account-specific parameter values. Copy params.example.json to params.json.
+# Matched by GLOB, not exact path: an exact rule would miss params.json.bak,
+# params.local.json or params-prod.json, any of which carries real VPC, subnet,
+# certificate and email values. The example file is negated back in.
+infra/params*.json
+!infra/params.example.json
+
+# Environment-specific verification records. These contain this account's ids,
+# VPC, subnets, security groups, filesystem and instance ids, and bucket names.
+# Kept locally, never published — the findings that matter are carried into the
+# README and runbook in redacted form.
+docs/
+
+# ------------------------------------------------------------- never commit
+# Credential and key material. None of this belongs in the repo, and a single
+# stray file here is the highest-severity outcome for a public repository, so
+# these are catch-alls rather than named paths.
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+id_ecdsa
+.env
+.env.*
+credentials
+.aws/
+.ssh/
+
+# Terraform state embeds full resource attributes including secrets. This
+# project is CloudFormation, so these should never appear — which is exactly
+# why the rule is cheap insurance.
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# ------------------------------------------------------------------- scratch
+# Backup and editor temp files. These bypass a named-path rule and are the
+# usual way a redacted file leaks its unredacted twin.
+*.bak
+*.orig
+*.rej
+*~
+*.swp
+*.swo
+.*.sw?
+
+# Script output. deploy.sh and rebuild-drill.sh write to stdout, but redirect
+# them once and the log lands here.
+*.log
+*.out
+*.tmp
+
+# Editor and OS state
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python, in case a helper script grows a virtualenv
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---------------------------------------------------------------- kiro local
+# Local editor / language-server state, not part of the deliverable.
+.kiro/settings/
+
+# Machine state for the spec workflow. The spec documents themselves are
+# published (see the README's repository layout); this file is not, because it
+# has no reader value.
+.kiro/specs/*/.spec-state.json

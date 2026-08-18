@@ -1,0 +1,1850 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Kiro Crew on AWS - a single always-on Crew Gateway with S3-backed state.
+  Region-locked to us-east-1: the CloudFront viewer certificate and the
+  CLOUDFRONT-scoped WAF web ACL must both be created there.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Access}
+        Parameters: [AccessMode, DomainName, HostedZoneId, CertificateArn]
+      - Label: {default: Network}
+        Parameters: [NetworkMode, VpcId, PrivateSubnetIds, EgressMode, VpcCidr]
+      - Label: {default: Compute}
+        Parameters: [InstanceType, ContainerImageDigest]
+      - Label: {default: Operations}
+        Parameters: [LogRetentionDays, NotificationEmail, OwnerTag]
+    ParameterLabels:
+      AccessMode: {default: How humans reach the dashboard}
+      NetworkMode: {default: Reuse an existing VPC or create one}
+
+Parameters:
+
+  AccessMode:
+    Type: String
+    AllowedValues: [front-door, ssm-only]
+    Default: ssm-only
+    Description: >-
+      front-door publishes CloudFront -> internal ALB -> Cognito and REQUIRES a
+      registered domain plus two ACM certificates. ssm-only creates none of that
+      and is reached over SSM port forwarding; it is cheaper and has no public
+      endpoint.
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: FQDN for the dashboard. Required when AccessMode is front-door.
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Route 53 hosted zone for DomainName. Required when AccessMode is front-door.
+
+  CertificateArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-z-]*:acm:us-east-1:\d{12}:certificate/[0-9a-f-]+$'
+    Description: >-
+      One ISSUED ACM certificate in us-east-1 covering DomainName. Required when
+      AccessMode is front-door. A single certificate serves BOTH the CloudFront
+      viewer connection and the internal ALB HTTPS listener, because this template
+      is pinned to us-east-1 and both requirements land in the same region. A
+      wildcard certificate works. Bring your own; the template never requests one,
+      so it cannot leave an orphaned certificate or a dangling validation record
+      behind on teardown.
+
+  NetworkMode:
+    Type: String
+    AllowedValues: [existing, create]
+    Default: existing
+    Description: >-
+      existing consumes VpcId and PrivateSubnetIds and creates no VPC, subnets,
+      routing or NAT - reusing egress you already pay for. create builds a
+      dedicated VPC with the egress path named by EgressMode.
+
+  VpcId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^vpc-[0-9a-f]{8}([0-9a-f]{9})?$'
+    Description: >-
+      Existing VPC. Required when NetworkMode is existing. Empty is valid only
+      when NetworkMode is create; the pattern catches a mistyped ID at parameter
+      validation instead of midway through stack creation.
+
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      Exactly two private subnet IDs in distinct Availability Zones, each with a
+      default route to a NAT gateway, NAT instance or transit gateway. Required
+      when NetworkMode is existing. scripts/deploy.sh pre-flights these.
+
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR for the created VPC. Ignored when NetworkMode is existing.
+
+  EgressMode:
+    Type: String
+    AllowedValues: [nat-gateway, nat-instance]
+    Default: nat-instance
+    Description: >-
+      Egress path for the created VPC. Ignored when NetworkMode is existing.
+      nat-gateway is simplest; nat-instance is roughly a tenth of the cost and
+      becomes infrastructure you operate.
+
+  InstanceType:
+    Type: String
+    Default: r8g.large
+    Description: >-
+      Crew's docs give a requirement, not an instance type: roughly 10 GB RAM
+      minimum, 16 GB comfortable, a couple of vCPUs enough for one user, extra
+      cores help with parallel subagents, and arm64 or x86_64 both fine.
+      r8g.large is the best price-performance shape clearing 16 GiB: Graviton4,
+      2 vCPU / 16 GiB, about $86/mo in us-east-1. AWS rates Graviton4 up to 30%
+      faster than Graviton3 with 75% more memory bandwidth for roughly 10% more
+      cost, and that bandwidth lands on this host's real CPU-bound work: the
+      in-process embedding model and SQLite on every turn. Model inference is
+      remote and network-bound, so no instance choice affects it. Alternatives:
+      m9g.xlarge is the newest generation (4 vCPU / 16 GiB, ~$143/mo) but buys
+      cores, and Crew sizes subagent concurrency to available MEMORY, so it does
+      not raise that ceiling; r8g.xlarge (4 vCPU / 32 GiB, ~$172/mo) is the shape
+      that does. Resizing is a stop, modify, start, so decide on CloudWatch
+      evidence after a week rather than up front.
+
+  ContainerImageDigest:
+    Type: String
+    Default: sha256:368ff37d3d3cf82d972eeb15fba1128fc09cb78b0004ddd19c39e9d3b7a9669a
+    AllowedPattern: '^sha256:[0-9a-f]{64}$'
+    Description: >-
+      Multi-arch index digest of ghcr.io/kirodotdev/kirocrew. Pin the index
+      digest, not a per-architecture digest, so one value works on any
+      architecture. Verify provenance with scripts/verify-image.sh before deploy.
+
+  SeccompProfileSha256:
+    Type: String
+    Default: b49d7ad01079965aad587afce24be6c9a6aec0e52d5e96303a15c64ea8226fab
+    AllowedPattern: '^[0-9a-f]{64}$'
+    Description: >-
+      SHA256 of upstream docker/seccomp/kirocrew-seccomp.json, which Crew's agent
+      sandbox requires. Boot fetches that file and refuses to continue if the
+      digest differs, so a change upstream fails closed rather than silently
+      loosening a security control. If upstream revises the profile, verify the
+      new file and update this value.
+
+  DataHomeUid:
+    Type: Number
+    Default: 1000
+    Description: >-
+      POSIX uid the S3 Files access point enforces on every file operation. It
+      MUST match the user the Crew container process runs as, or the Gateway
+      cannot write its own data home. 1000 is the usual non-root container user;
+      0 if the container runs as root.
+
+  DataHomeGid:
+    Type: Number
+    Default: 1000
+    Description: POSIX gid for the access point. Same constraint as DataHomeUid.
+
+  MfaMode:
+    Type: String
+    AllowedValues: ['ON', 'OPTIONAL', 'OFF']
+    Default: 'ON'
+    Description: >-
+      Cognito MFA enforcement for the front door. ON requires TOTP for every
+      sign-in and is the default because this endpoint is on the public internet
+      and fronts an agent that has shell access and an instance role. OPTIONAL
+      lets a user enrol but does not require it. OFF removes the second factor
+      entirely, leaving a password as the only thing between the internet and the
+      Gateway - Crew's own session token still applies, but that is a bearer
+      token, not a second factor.
+
+  CloudFrontPrefixListId:
+    Type: String
+    Default: ''
+    Description: >-
+      Managed prefix list id for com.amazonaws.global.cloudfront.origin-facing.
+      Required when AccessMode is front-door. This is the ONLY option that works
+      in a single CloudFormation pass: the alternative is CloudFront's
+      service-managed security group CloudFront-VPCOrigins-Service-SG, which does
+      not exist until after the VPC origin is created. scripts/deploy.sh resolves
+      this automatically, so you normally leave it blank.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: >-
+      Alarm destination. Deliberately email rather than a Crew channel, so
+      notification does not depend on the Gateway being healthy.
+
+  OwnerTag:
+    Type: String
+    Default: kirocrew
+    AllowedPattern: '^[a-z0-9-]{1,24}$'
+    Description: >-
+      Distinguishes one Gateway from another in the same account. Every globally
+      unique name derives from the stack name plus this value.
+
+Rules:
+
+  FrontDoorNeedsDomain:
+    RuleCondition: !Equals [!Ref AccessMode, front-door]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref DomainName, '']]
+        AssertDescription: DomainName is required when AccessMode is front-door.
+      - Assert: !Not [!Equals [!Ref HostedZoneId, '']]
+        AssertDescription: HostedZoneId is required when AccessMode is front-door.
+      - Assert: !Not [!Equals [!Ref CertificateArn, '']]
+        AssertDescription: >-
+          CertificateArn is required when AccessMode is front-door. One ISSUED
+          us-east-1 certificate covering DomainName serves both the CloudFront
+          viewer connection and the ALB HTTPS listener that authenticate-cognito
+          requires.
+
+  ExistingNetworkNeedsIds:
+    RuleCondition: !Equals [!Ref NetworkMode, existing]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref VpcId, '']]
+        AssertDescription: VpcId is required when NetworkMode is existing.
+
+  RegionIsUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', us-east-1]
+        AssertDescription: >-
+          This template must be deployed in us-east-1. The CloudFront viewer
+          certificate and the CLOUDFRONT-scoped WAF web ACL can only exist there,
+          and a single-region template cannot create them from elsewhere.
+
+Conditions:
+  MfaEnabled: !Not [!Equals [!Ref MfaMode, 'OFF']]
+  IsFrontDoor: !Equals [!Ref AccessMode, front-door]
+  CreateNetwork: !Equals [!Ref NetworkMode, create]
+  UseExistingNetwork: !Equals [!Ref NetworkMode, existing]
+  CreateNatGateway: !And
+    - !Condition CreateNetwork
+    - !Equals [!Ref EgressMode, nat-gateway]
+  CreateNatInstance: !And
+    - !Condition CreateNetwork
+    - !Equals [!Ref EgressMode, nat-instance]
+
+Resources:
+
+  # ============================================================ encryption keys
+  # Key policies grant only the account root, which delegates authorisation to
+  # IAM. Naming the instance role here instead would create a circular
+  # dependency, since the role's policy has to name the keys.
+
+  StateKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${AWS::StackName} Crew durable state'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DelegateToIam
+            Effect: Allow
+            Principal: {AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'}
+            Action: 'kms:*'
+            Resource: '*'
+          # Required for the Auto Scaling group to launch an instance whose root
+          # volume is encrypted with this customer-managed key. The Auto Scaling
+          # service-linked role provisions EBS on the group's behalf, and its
+          # AWS-managed identity policy does NOT convey use of a CUSTOMER key -
+          # a key policy statement is the only thing that grants it.
+          #
+          # Without these two statements every launch fails and the instance is
+          # terminated with "Client.InvalidKMSKey.InvalidState: The KMS key
+          # provided is in an incorrect state", which is thoroughly misleading:
+          # the key is Enabled and healthy, and the real problem is authorization.
+          # The ASG retries forever, so the stack update hangs rather than failing
+          # fast. A standalone AWS::EC2::Instance never hits this, because it is
+          # launched with the deployer's own credentials - so this surfaces only
+          # when converting to an ASG.
+          - Sid: AllowAutoScalingServiceLinkedRoleUse
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: AllowAutoScalingServiceLinkedRoleGrants
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling'
+            Action: kms:CreateGrant
+            Resource: '*'
+            Condition:
+              Bool: {'kms:GrantIsForAWSResource': 'true'}
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  StateKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-${OwnerTag}-state'
+      TargetKeyId: !Ref StateKey
+
+  SecretsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${AWS::StackName} Crew secrets'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DelegateToIam
+            Effect: Allow
+            Principal: {AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'}
+            Action: 'kms:*'
+            Resource: '*'
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  SecretsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-${OwnerTag}-secrets'
+      TargetKeyId: !Ref SecretsKey
+
+  # ================================================================== secrets
+  # Shells only. Values are populated out of band during bootstrap so that no
+  # secret ever appears in this template, in a parameter, or in an event log.
+
+  ChannelSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/${OwnerTag}/channels'
+      Description: Slack bot token, Slack app token, owner ID. Populated during bootstrap.
+      KmsKeyId: !Ref SecretsKey
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  KiroCliSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/${OwnerTag}/kiro-cli'
+      Description: >-
+        kiro-cli token material captured after the one-time device-code sign-in.
+        Restoring this is what makes host replacement unattended.
+      KmsKeyId: !Ref SecretsKey
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  AuditEpochSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/${OwnerTag}/audit-epochs'
+      Description: >-
+        Retired sel_hmac.key values keyed by host epoch, so historical audit-log
+        segments stay verifiable after the host is replaced.
+      KmsKeyId: !Ref SecretsKey
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  CognitoClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: IsFrontDoor
+    Properties:
+      Name: !Sub '${AWS::StackName}/${OwnerTag}/cognito-client'
+      Description: Cognito app client secret. The ALB requires the client to have one.
+      KmsKeyId: !Ref SecretsKey
+
+  # ============================================================== state bucket
+  # The system of record for Crew's data home. Versioning is on because S3 Files
+  # requires it on a linked bucket, and it doubles as the version history the
+  # design relies on instead of a separate backup.
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  StateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-${OwnerTag}-state-${AWS::AccountId}'
+      VersioningConfiguration: {Status: Enabled}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt StateKey.Arn
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 90}
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: auto-delete, Value: 'no'}
+
+  StateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StateBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonTls
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt StateBucket.Arn
+              - !Sub '${StateBucket.Arn}/*'
+            Condition: {Bool: {'aws:SecureTransport': false}}
+
+  # Access logs live apart from state, so a log reader is never a state reader.
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsFrontDoor
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-${OwnerTag}-logs-${AWS::AccountId}'
+      OwnershipControls:
+        # Left as BucketOwnerPreferred: flipping an EXISTING bucket to
+        # BucketOwnerEnforced fails with "Bucket cannot have ACLs set", because the
+        # ACL created under the previous setting is still present.
+        Rules: [{ObjectOwnership: BucketOwnerPreferred}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: auto-delete, Value: 'no'}
+
+  LogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: IsFrontDoor
+    Properties:
+      Bucket: !Ref LogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AlbAccessLogDelivery
+            Effect: Allow
+            Principal: {Service: logdelivery.elasticloadbalancing.amazonaws.com}
+            Action: 's3:PutObject'
+            Resource: !Sub '${LogBucket.Arn}/alb/*'
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+          - Sid: DenyNonTls
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt LogBucket.Arn, !Sub '${LogBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': false}}
+
+  # ================================================================== network
+  # Created only when NetworkMode=create. In existing mode the stack adds nothing
+  # but security groups, so it cannot damage or inherit ownership of your VPC.
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateNetwork
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true      # both required for the S3 Files mount to
+      EnableDnsHostnames: true    # resolve its mount-target hostname
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-${OwnerTag}'}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateNetwork
+    Properties:
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNetwork
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: CreateNatGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  PrivateDefaultRouteViaNatGateway:
+    Type: AWS::EC2::Route
+    Condition: CreateNatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  # =========================================================== security groups
+  # Rules are attached as separate resources so the groups can reference each
+  # other by ID without a circular dependency.
+
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: IsFrontDoor
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} internal ALB'
+      VpcId: !If [CreateNetwork, !Ref Vpc, !Ref VpcId]
+      SecurityGroupIngress:
+        # From CloudFront's origin-facing prefix list only. This replaces an
+        # earlier 10.0.0.0/8 placeholder, which was far too broad.
+        - Description: HTTPS from CloudFront origin-facing ranges
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-alb'}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  HostSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} Crew Gateway host'
+      VpcId: !If [CreateNetwork, !Ref Vpc, !Ref VpcId]
+      # No ingress here on purpose. In ssm-only mode the host has NO inbound
+      # rule at all; in front-door mode exactly one is added below, from AlbSg.
+      SecurityGroupEgress:
+        - Description: HTTPS out for the image pull, Kiro model traffic and AWS APIs
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-host'}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  FsSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} S3 Files mount target'
+      VpcId: !If [CreateNetwork, !Ref Vpc, !Ref VpcId]
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-fs'}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  HostIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsFrontDoor
+    Properties:
+      GroupId: !Ref HostSg
+      IpProtocol: tcp
+      FromPort: 5476
+      ToPort: 5476
+      SourceSecurityGroupId: !Ref AlbSg
+      Description: Gateway port, from the internal ALB only
+
+  AlbEgressToHost:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: IsFrontDoor
+    Properties:
+      GroupId: !Ref AlbSg
+      IpProtocol: tcp
+      FromPort: 5476
+      ToPort: 5476
+      DestinationSecurityGroupId: !Ref HostSg
+      Description: Gateway port on the host
+
+  AlbEgressToIdp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: IsFrontDoor
+    Properties:
+      GroupId: !Ref AlbSg
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      # authenticate-cognito makes the load balancer an HTTP *client*: it calls
+      # the Cognito token endpoint server-side to exchange the authorization
+      # code, then the user-info endpoint. Those live on the hosted UI domain
+      # (<prefix>.auth.<region>.amazoncognito.com), which is a public endpoint:
+      # there is no prefix list for it, and the cognito-idp interface endpoint
+      # does not serve the /oauth2/* routes. So this cannot be narrowed below
+      # 0.0.0.0/0 without breaking sign-in. Without this rule the token call is
+      # blackholed and the ALB returns 500 with AuthTokenEpRequestTimeout on
+      # /oauth2/idpresponse, after Cognito sign-in has already succeeded.
+      Description: Cognito token and user-info endpoints for authenticate-cognito
+
+  HostEgressToFs:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref HostSg
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      DestinationSecurityGroupId: !Ref FsSg
+      Description: NFS to the S3 Files mount target
+
+  FsIngressFromHost:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref FsSg
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref HostSg
+      Description: NFS from the Gateway host
+
+  FsEgressToHost:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref FsSg
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      DestinationSecurityGroupId: !Ref HostSg
+      Description: NFS back to the Gateway host
+
+  # ========================================================= S3 Files sync role
+  # Passed as roleArn to the file system. S3 Files assumes this to read and write
+  # bucket objects and to manage its own EventBridge sync rules.
+  #
+  # The AWS console creates this role automatically. CloudFormation does NOT, so
+  # it must be declared here or CreateFileSystem fails for want of a roleArn.
+  #
+  # READ THIS BEFORE EDITING: the two halves use DIFFERENT condition keys.
+  #   trust policy  -> aws:SourceAccount   (which account's S3 Files is assuming)
+  #   inline policy -> aws:ResourceAccount (which account owns the bucket)
+  # Using aws:SourceAccount in the inline policy fails SILENTLY: the file system
+  # creates, it mounts, and every file written to it sits in PendingExport
+  # forever, with no error on CreateFileSystem. When S3 Files calls S3 the source
+  # is the service, not this account, so the condition never matches and every
+  # request is denied. The PendingExports alarm below exists to catch it.
+  #
+  # The s3:GetObject* / s3:PutObject* wildcards are deliberate. Enumerating
+  # actions risks omitting s3:GetObjectVersionTagging, which S3 Files reads during
+  # sync; without it some objects sync and others do not.
+
+  FileSystemSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-${OwnerTag}-s3files-sync'
+      Description: Assumed by S3 Files to synchronise the data home with the state bucket.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3FilesAssumeRole
+            Effect: Allow
+            Principal:
+              # S3 Files shares the EFS service principal, not an s3files one.
+              Service: elasticfilesystem.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:s3files:${AWS::Region}:${AWS::AccountId}:file-system/*'
+      Policies:
+        - PolicyName: s3files-sync
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3BucketPermissions
+                Effect: Allow
+                Action: ['s3:ListBucket', 's3:ListBucketVersions']
+                Resource: !GetAtt StateBucket.Arn
+                Condition:
+                  StringEquals: {'aws:ResourceAccount': !Ref 'AWS::AccountId'}
+              - Sid: S3ObjectPermissions
+                Effect: Allow
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:DeleteObject*'
+                  - 's3:GetObject*'
+                  - 's3:List*'
+                  - 's3:PutObject*'
+                Resource: !Sub '${StateBucket.Arn}/*'
+                Condition:
+                  StringEquals: {'aws:ResourceAccount': !Ref 'AWS::AccountId'}
+              - Sid: UseKmsKeyWithS3Files
+                Effect: Allow
+                Action:
+                  - 'kms:GenerateDataKey'
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                  - 'kms:ReEncryptFrom'
+                  - 'kms:ReEncryptTo'
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:*'
+                Condition:
+                  StringLike:
+                    'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+                    'kms:EncryptionContext:aws:s3:arn':
+                      - !GetAtt StateBucket.Arn
+                      - !Sub '${StateBucket.Arn}/*'
+              - Sid: EventBridgeManage
+                Effect: Allow
+                Action:
+                  - 'events:DeleteRule'
+                  - 'events:DisableRule'
+                  - 'events:EnableRule'
+                  - 'events:PutRule'
+                  - 'events:PutTargets'
+                  - 'events:RemoveTargets'
+                Resource: !Sub 'arn:${AWS::Partition}:events:*:*:rule/DO-NOT-DELETE-S3-Files*'
+                Condition:
+                  StringEquals: {'events:ManagedBy': elasticfilesystem.amazonaws.com}
+              - Sid: EventBridgeRead
+                Effect: Allow
+                Action:
+                  - 'events:DescribeRule'
+                  - 'events:ListRuleNamesByTarget'
+                  - 'events:ListRules'
+                  - 'events:ListTargetsByRule'
+                Resource: !Sub 'arn:${AWS::Partition}:events:*:*:rule/*'
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  # ================================================================ S3 Files
+  # The data home itself. Crew's KIROCREW_HOME points at the mount, so every
+  # SQLite database, conversation log and memory file lands in the state bucket
+  # as an object. No sync script, no scheduled job.
+  #
+  # Availability-zone constraint: a mount target exists in ONE subnet, and a
+  # client must be in that subnet's AZ to reach it. The instance therefore lands
+  # in the same subnet. A replacement host in the other AZ needs a second mount
+  # target, which is why PrivateSubnetIds takes two.
+
+  FileSystem:
+    Type: AWS::S3Files::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # ARN, not the bucket name: the schema pattern is
+      # ^(arn:aws[a-zA-Z0-9-]*:s3:::.+)$ even though the underlying API takes a
+      # plain bucket name.
+      Bucket: !GetAtt StateBucket.Arn
+      RoleArn: !GetAtt FileSystemSyncRole.Arn
+      KmsKeyId: !GetAtt StateKey.Arn
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  MountTarget:
+    Type: AWS::S3Files::MountTarget
+    Properties:
+      # NOT !Ref FileSystem: this type's primary identifier is FileSystemArn, so
+      # Ref returns an ARN where an id is required.
+      FileSystemId: !GetAtt FileSystem.FileSystemId
+      SubnetId: !If
+        - CreateNetwork
+        - !Ref PrivateSubnet1
+        - !Select [0, !Ref PrivateSubnetIds]
+      SecurityGroups: [!Ref FsSg]
+
+  # POSIX identity is enforced by the access point, so it must match the user the
+  # Crew container runs as or the Gateway cannot write its own data home. Objects
+  # written to the bucket from outside the file system arrive as root:root 644,
+  # which is readable but not writable by a non-root container.
+  #
+  # PosixUser is create-only: changing DataHomeUid or DataHomeGid REPLACES the
+  # access point rather than updating it.
+  AccessPoint:
+    Type: AWS::S3Files::AccessPoint
+    Properties:
+      FileSystemId: !GetAtt FileSystem.FileSystemId
+      PosixUser:
+        Uid: !Ref DataHomeUid
+        Gid: !Ref DataHomeGid
+      RootDirectory:
+        Path: /crew
+        CreationPermissions:
+          OwnerUid: !Ref DataHomeUid
+          OwnerGid: !Ref DataHomeGid
+          Permissions: '0700'
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  # ============================================================= instance role
+  # Least privilege per design section 6.3: state, its keys, its secrets, its log
+  # group, Session Manager. No IAM, no EC2 mutation, no other bucket.
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-${OwnerTag}-host'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        # Mount-helper client access to S3 Files. Without this the mount fails with
+        # "Access denied" even though the inline S3 permissions below are correct.
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonS3FilesClientFullAccess'
+        # Lets the client publish its own CloudWatch metrics (S3BucketAccessible,
+        # S3BucketReachable, NFSConnectionAccessible) that the alarms below use.
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonElasticFileSystemsUtils'
+      Policies:
+        - PolicyName: state-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StateBucketObjects
+                Effect: Allow
+                Action:
+                  # GetObjectVersionTagging is NOT optional: S3 Files reads version
+                  # tags during sync, and omitting it causes partial sync failures
+                  # where some objects sync and others silently do not.
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:GetObjectVersionTagging'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:DeleteObjectVersion'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketVersions'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !GetAtt StateBucket.Arn
+                  - !Sub '${StateBucket.Arn}/*'
+              - Sid: StateAndSecretKeys
+                Effect: Allow
+                Action: ['kms:Decrypt', 'kms:GenerateDataKey', 'kms:DescribeKey']
+                Resource: [!GetAtt StateKey.Arn, !GetAtt SecretsKey.Arn]
+              - Sid: ReadOwnSecrets
+                Effect: Allow
+                Action: ['secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret']
+                Resource:
+                  - !Ref ChannelSecret
+                  - !Ref KiroCliSecret
+                  - !Ref AuditEpochSecret
+              - Sid: RotateAuditEpochKeys
+                Effect: Allow
+                Action: ['secretsmanager:PutSecretValue']
+                Resource: !Ref AuditEpochSecret
+              - Sid: OwnLogGroup
+                Effect: Allow
+                Action: ['logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams']
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/kirocrew/${AWS::StackName}:*'
+              - Sid: PublishOwnMetrics
+                Effect: Allow
+                Action: 'cloudwatch:PutMetricData'
+                Resource: '*'
+                Condition:
+                  StringEquals: {'cloudwatch:namespace': !Sub 'KiroCrew/${AWS::StackName}'}
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ============================================================ compute
+  # One instance, supervised by systemd, in the same AZ as the mount target.
+  # TagSpecifications tag the instance AND its volumes separately: a volume that
+  # inherits nothing is exactly the orphan an account cleanup sweep deletes.
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-${OwnerTag}'
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Arn: !GetAtt InstanceProfile.Arn}
+        # No KeyName on purpose: access is Session Manager only.
+        MetadataOptions:
+          HttpTokens: required          # IMDSv2
+          HttpPutResponseHopLimit: 1    # container cannot reach IMDS
+          InstanceMetadataTags: enabled
+        Monitoring: {Enabled: true}
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 40
+              VolumeType: gp3
+              Encrypted: true
+              KmsKeyId: !GetAtt StateKey.Arn
+              DeleteOnTermination: true   # the data home is on S3 Files, not here
+        # Security group at the top level, NOT a NetworkInterfaces block. An ASG
+        # rejects a launch template that names a SubnetId in NetworkInterfaces
+        # while VPCZoneIdentifier is also set ("Incompatible launch template"),
+        # and the subnet must come from the ASG so it can be pinned to the AZ
+        # holding the single S3 Files mount target. Public-IP behaviour then
+        # follows the subnet, which is why the pre-flight asserts these are
+        # private subnets: both carry MapPublicIpOnLaunch=false.
+        SecurityGroupIds: [!Ref HostSg]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - {Key: Name, Value: !Sub '${AWS::StackName}-${OwnerTag}'}
+              - {Key: Project, Value: kirocrew-on-aws}
+              - {Key: Owner, Value: !Ref OwnerTag}
+              - {Key: auto-delete, Value: 'no'}
+          - ResourceType: volume
+            Tags:
+              - {Key: Name, Value: !Sub '${AWS::StackName}-${OwnerTag}-root'}
+              - {Key: Project, Value: kirocrew-on-aws}
+              - {Key: Owner, Value: !Ref OwnerTag}
+              - {Key: auto-delete, Value: 'no'}
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              exec > >(tee /var/log/crew-bootstrap.log|logger -t crew -s 2>/dev/console) 2>&1
+              # generation marker: bumping this forces a launch-template version and
+              # therefore an instance replacement, which is how the rebuild drill is run
+              # without a destructive terminate call. See docs/storage-verification.md.
+              echo "crew-generation=2"
+
+              MOUNT=/mnt/crewhome
+              SENTINEL="$MOUNT/.crew-data-home"
+              NS="KiroCrew/${AWS::StackName}"
+
+              dnf -y install docker amazon-efs-utils || dnf -y install docker
+              systemctl enable --now docker
+
+              # S3 Files needs amazon-efs-utils >= 3.0.0; that is the version which
+              # first ships mount.s3files. The distro package may lag, so verify and
+              # fall back to the upstream installer rather than discovering a missing
+              # mount helper later.
+              need_installer=0
+              command -v mount.s3files >/dev/null 2>&1 || need_installer=1
+              if [ "$need_installer" = "0" ]; then
+                ver=$(rpm -q --qf '%{VERSION}' amazon-efs-utils 2>/dev/null || echo 0)
+                major=${!ver%%.*}
+                [ "${!major:-0}" -ge 3 ] 2>/dev/null || need_installer=1
+              fi
+              if [ "$need_installer" = "1" ]; then
+                echo "installing amazon-efs-utils from upstream (need >= 3.0.0)"
+                curl -fsSL https://amazon-efs-utils.aws.com/efs-utils-installer.sh | sh -s -- --install
+              fi
+              command -v mount.s3files >/dev/null || { echo "FATAL: mount.s3files still absent"; exit 1; }
+
+              # ---------------------------------------------------------- 1. mount
+              # Fails CLOSED. If this unit does not succeed the Gateway never starts,
+              # because a Crew that finds an empty directory silently initialises a
+              # fresh data home on the root volume - no memory, and new state
+              # accumulating somewhere that is never backed up.
+              mkdir -p "$MOUNT"
+              cat >/etc/systemd/system/crew-mount.service <<'UNIT'
+              [Unit]
+              Description=Mount the Crew data home from S3 Files
+              After=network-online.target
+              Wants=network-online.target
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStart=/usr/local/bin/crew-mount.sh
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+
+              cat >/usr/local/bin/crew-mount.sh <<SCRIPT
+              #!/bin/bash
+              set -euo pipefail
+              MOUNT=$MOUNT
+              SENTINEL=$SENTINEL
+              AP=${AccessPoint.AccessPointId}
+              FS=${FileSystem.FileSystemId}
+
+              command -v mount.s3files >/dev/null || { echo "s3files mount helper missing"; exit 1; }
+
+              mountpoint -q "\$MOUNT" || mount -t s3files -o tls,accesspoint="\$AP" "\$FS" "\$MOUNT"
+              mountpoint -q "\$MOUNT" || { echo "mount did not establish"; exit 1; }
+
+              # Distinguish a legitimate first boot from a broken or partial mount.
+              if [ ! -f "\$SENTINEL" ]; then
+                if [ -z "\$(ls -A "\$MOUNT" 2>/dev/null)" ]; then
+                  echo "empty data home: first boot, seeding sentinel"
+                  printf 'kirocrew data home\n' > "\$SENTINEL"
+                else
+                  echo "data home has content but no sentinel - refusing to start"
+                  exit 1
+                fi
+              fi
+              # kiro-cli's credential store lives OUTSIDE the data home on purpose.
+              # Crew hides its own data home from the sandboxed CLI it probes and
+              # from ACP agent sessions. Because this deployment sets
+              # KIROCREW_HOME to the whole home directory, a credential store at
+              # the default ~/.local/share/kiro-cli would be hidden too - the CLI
+              # then cannot see its own login, so `whoami` reports "Not logged in"
+              # and both the setup gate and every agent turn fail while an
+              # unsandboxed `kiro-cli whoami` succeeds. Same storage, different
+              # container path, so the hide does not cover it.
+              mkdir -p "\$MOUNT/xdg-data"
+              echo "data home ready"
+              SCRIPT
+              chmod +x /usr/local/bin/crew-mount.sh
+
+              # -------------------------------------------------------- 2. secrets
+              cat >/etc/systemd/system/crew-secrets.service <<'UNIT'
+              [Unit]
+              Description=Materialise Crew credentials from Secrets Manager
+              After=crew-mount.service
+              Requires=crew-mount.service
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStart=/usr/local/bin/crew-secrets.sh
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+
+              cat >/usr/local/bin/crew-secrets.sh <<SCRIPT
+              #!/bin/bash
+              set -euo pipefail
+              umask 077
+              ENVFILE=/etc/crew/channels.env
+              mkdir -p /etc/crew
+              : > "\$ENVFILE"
+              # Channel credentials are handed to the container, whose entrypoint moves
+              # them into the data home .env at mode 600 and clears them from the
+              # long-lived process environment.
+              if v=\$(aws secretsmanager get-secret-value --region ${AWS::Region} \
+                       --secret-id ${ChannelSecret} --query SecretString --output text 2>/dev/null); then
+                # Single-line python on purpose: a multi-line -c body inside a heredoc
+                # inherits the heredoc's indentation and dies with IndentationError.
+                printf '%s' "\$v" | python3 -c "import json,sys;d=json.load(sys.stdin);print('\n'.join(f'{k}={v}' for k,v in d.items()))" >> "\$ENVFILE" 2>/dev/null || true
+              fi
+              chmod 600 "\$ENVFILE"
+              echo "credentials materialised"
+              SCRIPT
+              chmod +x /usr/local/bin/crew-secrets.sh
+
+              # ------------------------------------------------- 2b. sandbox profile
+              # Crew isolates each agent subprocess in a user namespace, which needs
+              # unshare(CLONE_NEWUSER). Docker's DEFAULT seccomp profile denies that
+              # with EPERM, so without this the Gateway serves the dashboard happily
+              # and then refuses every agent turn with SandboxUnavailableError - a
+              # failure that looks like a Crew bug and is actually container policy.
+              #
+              # Upstream ships a profile that is the Docker default plus
+              # unconditional unshare/clone/mount/setns allows. It keeps
+              # defaultAction SCMP_ACT_ERRNO, so it is materially narrower than
+              # seccomp=unconfined. We deliberately do NOT set
+              # KIROCREW_ALLOW_UNSANDBOXED or sandbox_allow_unsandboxed_exec: this
+              # host holds an IAM role with data access, so the container must not be
+              # the only boundary around agent-authored code.
+              #
+              # Pinned by SHA256 and fails CLOSED, because this is a security control
+              # arriving over the network. Boot already needs the internet to pull the
+              # image from ghcr.io, so this adds no new class of dependency - but a
+              # zero-egress deployment must stage this file itself.
+              SECCOMP=/etc/crew/kirocrew-seccomp.json
+              mkdir -p /etc/crew
+              for attempt in 1 2 3 4 5; do
+                curl -fsSL --max-time 30 \
+                  https://raw.githubusercontent.com/kirodotdev/KiroCrew/main/docker/seccomp/kirocrew-seccomp.json \
+                  -o "$SECCOMP" && break
+                echo "seccomp fetch attempt $attempt failed; retrying in 5s"
+                sleep 5
+              done
+              got=$(sha256sum "$SECCOMP" 2>/dev/null | awk '{print $1}')
+              if [ "$got" != "${SeccompProfileSha256}" ]; then
+                rm -f "$SECCOMP"
+                echo "FATAL: seccomp profile digest mismatch (got '$got' want '${SeccompProfileSha256}')"
+                exit 1
+              fi
+              echo "seccomp profile verified: $got"
+
+              # -------------------------------------------------------- 3. gateway
+              cat >/etc/systemd/system/crew-gateway.service <<UNIT
+              [Unit]
+              Description=Kiro Crew Gateway
+              After=crew-secrets.service docker.service
+              Requires=crew-secrets.service docker.service
+              [Service]
+              Restart=always
+              RestartSec=10
+              ExecStartPre=-/usr/bin/docker rm -f crew
+              ExecStartPre=/usr/bin/test -s /etc/crew/kirocrew-seccomp.json
+              ExecStart=/usr/bin/docker run --rm --name crew \\
+                --security-opt seccomp=/etc/crew/kirocrew-seccomp.json \\
+                --log-driver=awslogs \\
+                --log-opt awslogs-region=${AWS::Region} \\
+                --log-opt awslogs-group=/kirocrew/${AWS::StackName} \\
+                --log-opt awslogs-stream=gateway \\
+                -p ${PublishSpec} \\
+                -v $MOUNT:/home/kirocrew \\
+                -v $MOUNT/xdg-data:/xdg-data \\
+                --env-file /etc/crew/channels.env \\
+                -e KIROCREW_HOME=/home/kirocrew \\
+                -e XDG_DATA_HOME=/xdg-data \\
+                -e KIROCREW_BIND=0.0.0.0 ${CorsSpec} \\
+                ghcr.io/kirodotdev/kirocrew@${ContainerImageDigest}
+              ExecStop=/usr/bin/docker stop crew
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+
+              # --------------------------------------------------------- 4. health
+              cat >/usr/local/bin/crew-health.sh <<SCRIPT
+              #!/bin/bash
+              set -uo pipefail
+              NS="$NS"
+              BUCKET=${StateBucket}
+              healthy=0; readable=0; bucket=0
+              curl -fsS --max-time 5 http://127.0.0.1:5476/api/health >/dev/null 2>&1 && healthy=1
+              [ -f "$SENTINEL" ] && readable=1
+              # Direct test of what actually matters: can THIS instance's role reach
+              # the state bucket. Published with NO dimensions on purpose. The mount
+              # client's own S3BucketAccessible carries an InstanceId dimension,
+              # which cannot be alarmed on under an Auto Scaling group: a pinned id
+              # goes stale on every self-heal, and CloudWatch rejects a SEARCH
+              # expression outright ("SEARCH is not supported on Metric Alarms").
+              aws s3api head-bucket --region ${AWS::Region} --bucket "\$BUCKET" >/dev/null 2>&1 && bucket=1
+              aws cloudwatch put-metric-data --region ${AWS::Region} --namespace "\$NS" \
+                --metric-data "MetricName=GatewayHealthy,Value=\$healthy,Unit=None" \
+                              "MetricName=DataHomeReadable,Value=\$readable,Unit=None" \
+                              "MetricName=BucketAccessible,Value=\$bucket,Unit=None"
+              SCRIPT
+              chmod +x /usr/local/bin/crew-health.sh
+
+              cat >/etc/systemd/system/crew-health.service <<'UNIT'
+              [Unit]
+              Description=Publish Crew health metrics
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/local/bin/crew-health.sh
+              UNIT
+              cat >/etc/systemd/system/crew-health.timer <<'UNIT'
+              [Unit]
+              Description=Publish Crew health metrics every 5 minutes
+              [Timer]
+              OnBootSec=3min
+              OnUnitActiveSec=5min
+              [Install]
+              WantedBy=timers.target
+              UNIT
+
+              systemctl daemon-reload
+              systemctl enable --now crew-mount.service
+              systemctl enable --now crew-secrets.service
+              systemctl enable --now crew-gateway.service
+              systemctl enable --now crew-health.timer
+              echo "bootstrap complete"
+
+            - PublishSpec: !If [IsFrontDoor, '5476:5476', '127.0.0.1:5476:5476']
+              # Crew runs a DNS-rebinding barrier: the Host header must name a
+              # host it serves, and the allowlist is derived from the CSRF origin
+              # allowlist. Behind CloudFront the browser sends the custom domain,
+              # which Crew has never heard of, so every request is 403 "Host
+              # header not allowed" until the origin is declared here. Empty in
+              # ssm-only mode, where the browser reaches Crew over a forwarded
+              # loopback port and the built-in loopback origins already match.
+              # Substituted mid-line, so it carries no line-continuation escape.
+              CorsSpec: !If
+                - IsFrontDoor
+                - !Sub '-e KIROCREW_CORS_ORIGINS=https://${DomainName}'
+                - ''
+
+  # A single-instance Auto Scaling group, purely for self-healing. It is NOT a
+  # scaling mechanism and must never become one: Crew's data home is SQLite on a
+  # shared mount, so a second writer risks corrupting memory.db. MinSize and
+  # MaxSize are both 1 so the group can never exceed one instance even mid-
+  # replacement, which is also what makes replacement terminate-then-launch.
+  #
+  # HealthCheckType is EC2, deliberately NOT ELB. ELB health checks would replace
+  # the host whenever /api/health fails - but the Gateway answers unhealthy for
+  # ordinary reasons (a lapsed kiro-cli login, a stale gateway.lock during
+  # startup), and replacing the instance does not fix either. That is a
+  # replacement storm on a stateful single-writer host. EC2 checks cover the
+  # failure this exists for: the instance itself dying, being terminated, or being
+  # retired by AWS.
+  #
+  # NOTE ON STOPPING: an ASG treats a stopped instance as unhealthy and replaces
+  # it. To pause the Gateway, set DesiredCapacity to 0 - do not stop the instance.
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [MountTarget, AccessPoint]
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-${OwnerTag}'
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      # ONE subnet on purpose. There is a single mount target, in this AZ; an
+      # instance launched in the other AZ cannot reach it and fails closed at
+      # crew-mount.service. Availability is bounded by that AZ by design.
+      VPCZoneIdentifier:
+        - !If
+          - CreateNetwork
+          - !Ref PrivateSubnet1
+          - !Select [0, !Ref PrivateSubnetIds]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      HealthCheckType: EC2
+      # Boot installs docker and efs-utils, fetches the seccomp profile, mounts
+      # S3 Files and pulls the image. Measured at roughly 2-3 minutes.
+      HealthCheckGracePeriod: 600
+      TargetGroupARNs: !If [IsFrontDoor, [!Ref TargetGroup], !Ref 'AWS::NoValue']
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-${OwnerTag}', PropagateAtLaunch: true}
+        - {Key: Project, Value: kirocrew-on-aws, PropagateAtLaunch: true}
+        - {Key: Owner, Value: !Ref OwnerTag, PropagateAtLaunch: true}
+        - {Key: auto-delete, Value: 'no', PropagateAtLaunch: true}
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        # MaxBatchSize 1 with MinInstancesInService 0 is what keeps the single
+        # writer invariant during a rolling update: the old instance is gone
+        # before the new one launches. It costs a short outage and buys not
+        # having two gateways on one SQLite data home.
+        MaxBatchSize: 1
+        MinInstancesInService: 0
+        PauseTime: PT10M
+        WaitOnResourceSignals: false
+
+  # ============================================================ observability
+  # Alarms route to email, not to a Crew channel: notification must not depend on
+  # the Gateway being healthy, which is exactly what these alarms watch.
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/kirocrew/${AWS::StackName}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-${OwnerTag}-alarms'
+      DisplayName: Kiro Crew alarms
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Published by crew-health.timer on the host. TreatMissingData=breaching is the
+  # point: a host that stops reporting is indistinguishable from a host that is
+  # down, and both should page.
+  GatewayUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-${OwnerTag}-GatewayUnhealthy'
+      AlarmDescription: >-
+        Crew's health endpoint stopped answering, or the host stopped reporting at
+        all. Check crew-gateway.service first, then crew-mount.service.
+      Namespace: !Sub 'KiroCrew/${AWS::StackName}'
+      MetricName: GatewayHealthy
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # A detached mount with a still-running container is the failure mode most
+  # likely to look healthy while quietly losing data, so it gets its own alarm
+  # rather than being folded into the health check.
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  MountMissingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-${OwnerTag}-MountMissing'
+      AlarmDescription: >-
+        The Crew data home is not readable on the host. State may be accumulating
+        somewhere that is not backed up. Stop the Gateway before investigating.
+      Namespace: !Sub 'KiroCrew/${AWS::StackName}'
+      MetricName: DataHomeReadable
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+  # ---- S3 Files sync health -------------------------------------------------
+  # These three are the instruments that actually catch storage failure. The
+  # custom GatewayHealthy/DataHomeReadable pair above says whether Crew is up;
+  # these say whether what it wrote is reaching S3.
+
+  # The detector for the aws:SourceAccount / aws:ResourceAccount trap documented
+  # on FileSystemSyncRole. If the sync role's inline policy uses the wrong
+  # condition key, the mount works, Crew looks healthy, and writes pile up here
+  # forever. Measured baseline: ExportAge ~66s under light load, PendingExports
+  # returning to zero.
+  PendingExportsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-${OwnerTag}-PendingExports'
+      AlarmDescription: >-
+        Files written to the data home are not reaching S3. Most likely the sync
+        role cannot read or write the bucket. Check that its INLINE policy uses
+        aws:ResourceAccount, not aws:SourceAccount.
+      Namespace: AWS/S3/Files
+      MetricName: PendingExports
+      Dimensions: [{Name: FileSystemId, Value: !GetAtt FileSystem.FileSystemId}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 6          # 30 minutes: tolerate normal export lag
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # Export failures are NOT retried, so any non-zero value is silent data loss.
+  ExportFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-${OwnerTag}-ExportFailures'
+      AlarmDescription: >-
+        A file failed to export to S3 and will not be retried. Treat as data loss
+        until proven otherwise.
+      Namespace: AWS/S3/Files
+      MetricName: ExportFailures
+      Dimensions: [{Name: FileSystemId, Value: !GetAtt FileSystem.FileSystemId}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # Published by the mount client on the instance, which is why the instance role
+  # carries AmazonElasticFileSystemsUtils - without it this metric never appears
+  # and this alarm is permanently blind.
+  #
+  # The dimensions are NOT optional. The client publishes with Bucket and
+  # InstanceId, and an alarm that omits them matches only datapoints published
+  # with no dimensions - which is none of them. Symptom: the alarm sits in
+  # INSUFFICIENT_DATA forever while the metric is visibly present in the console.
+  #
+  # Under an Auto Scaling group there is no static instance id to pin, so the
+  # earlier `!Ref Instance` dimension would go stale on every self-heal - exactly
+  # reintroducing the blind alarm. CloudWatch also refuses the obvious workaround:
+  # a SEARCH expression across instances fails with "SEARCH is not supported on
+  # Metric Alarms", because an alarm needs one deterministic series.
+  #
+  # So this no longer alarms on the mount client's metric at all. crew-health.sh
+  # calls head-bucket with the instance role every cycle and publishes
+  # BucketAccessible with NO dimensions. That is a more direct test of the thing
+  # worth detecting - an IAM regression against the state bucket - and it is
+  # stable across instance replacement.
+  BucketAccessibleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-${OwnerTag}-S3BucketAccessible'
+      AlarmDescription: >-
+        The instance role cannot reach the state bucket (head-bucket failed).
+        Fires on an IAM or bucket-policy regression.
+      Namespace: !Sub 'KiroCrew/${AWS::StackName}'
+      MetricName: BucketAccessible
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: missing      # absent metrics are not an outage
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ============================================================== front door
+  # Everything below exists only when AccessMode=front-door.
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Condition: IsFrontDoor
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-${OwnerTag}'
+      # No self-signup: this fronts a single-owner agent workspace.
+      AdminCreateUserConfig: {AllowAdminCreateUserOnly: true}
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: !Ref MfaMode
+      # EnabledMfas may only be set when MfaConfiguration is ON or OPTIONAL;
+      # supplying it with OFF is rejected.
+      EnabledMfas: !If [MfaEnabled, [SOFTWARE_TOKEN_MFA], !Ref 'AWS::NoValue']
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 16
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      UserPoolTags:
+        Project: kirocrew-on-aws
+        Owner: !Ref OwnerTag
+        auto-delete: 'no'
+
+  # The ALB requires a client secret and the authorization-code flow. A scope that
+  # returns an ID token is also required: openid does, aws.cognito.signin.user.admin
+  # does not.
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: IsFrontDoor
+    Properties:
+      ClientName: !Sub '${AWS::StackName}-alb'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub 'https://${DomainName}/oauth2/idpresponse']
+      LogoutURLs: [!Sub 'https://${DomainName}']
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Condition: IsFrontDoor
+    Properties:
+      # Must be globally unique across all Cognito domains.
+      Domain: !Sub '${AWS::StackName}-${OwnerTag}-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: IsFrontDoor
+    # Access-log delivery is validated at ALB creation, so the bucket policy must
+    # already exist. Without this the ALB fails with "Access Denied for bucket".
+    DependsOn: LogBucketPolicy
+    Properties:
+      Name: !Sub '${AWS::StackName}-${OwnerTag}'
+      Scheme: internal          # reachable only as a CloudFront VPC origin
+      Type: application
+      SecurityGroups: [!Ref AlbSg]
+      Subnets: !If
+        - CreateNetwork
+        - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+        - !Ref PrivateSubnetIds
+      LoadBalancerAttributes:
+        # Without these, an authenticate-cognito failure is invisible: the ALB
+        # returns 500 and there is nothing to read.
+        - {Key: access_logs.s3.enabled, Value: 'true'}
+        - {Key: access_logs.s3.bucket, Value: !Ref LogBucket}
+        - {Key: access_logs.s3.prefix, Value: alb}
+        - {Key: idle_timeout.timeout_seconds, Value: '300'}
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: IsFrontDoor
+    Properties:
+      Name: !Sub '${AWS::StackName}-${OwnerTag}'
+      VpcId: !If [CreateNetwork, !Ref Vpc, !Ref VpcId]
+      TargetType: instance
+      Protocol: HTTP
+      Port: 5476
+      # No Targets here: the Auto Scaling group registers and deregisters its
+      # instance via TargetGroupARNs. A static Targets list would fight it and go
+      # stale the first time the instance is replaced.
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: {HttpCode: 200-399}
+      TargetGroupAttributes:
+        # WebSocket connections are long-lived; the 60s default would cut streams.
+        - {Key: deregistration_delay.timeout_seconds, Value: '30'}
+        - {Key: stickiness.enabled, Value: 'true'}
+        - {Key: stickiness.type, Value: lb_cookie}
+
+  # authenticate-cognito is valid ONLY on an HTTPS listener, which is why the
+  # internal ALB terminates TLS rather than taking plain HTTP from CloudFront.
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: IsFrontDoor
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates: [{CertificateArn: !Ref CertificateArn}]
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: authenticate-cognito
+          Order: 1
+          AuthenticateCognitoConfig:
+            UserPoolArn: !GetAtt UserPool.Arn
+            UserPoolClientId: !Ref UserPoolClient
+            UserPoolDomain: !Ref UserPoolDomain
+            Scope: 'openid email'
+            SessionTimeout: 28800            # 8h, not the 7-day default
+            OnUnauthenticatedRequest: authenticate
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref TargetGroup
+
+  # Priority 1: API and WebSocket paths DENY instead of redirecting. An expired
+  # session on an XHR or WS upgrade must return 401, because a single-page app
+  # cannot follow a 302 to a Cognito HTML login page. The ALB docs call this out
+  # specifically for SPAs.
+  ApiListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: IsFrontDoor
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: ['/api/*', '/ws', '/ws/*']
+      Actions:
+        - Type: authenticate-cognito
+          Order: 1
+          AuthenticateCognitoConfig:
+            UserPoolArn: !GetAtt UserPool.Arn
+            UserPoolClientId: !Ref UserPoolClient
+            UserPoolDomain: !Ref UserPoolDomain
+            Scope: 'openid email'
+            SessionTimeout: 28800
+            OnUnauthenticatedRequest: deny
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref TargetGroup
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: IsFrontDoor
+    Properties:
+      Name: !Sub '${AWS::StackName}-${OwnerTag}'
+      Scope: CLOUDFRONT          # must be created in us-east-1, which this template pins
+      DefaultAction: {Allow: {}}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${AWS::StackName}-webacl'
+      Rules:
+        - Name: RateLimit
+          Priority: 0
+          Action: {Block: {}}
+          Statement:
+            RateBasedStatement: {Limit: 2000, AggregateKeyType: IP}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${AWS::StackName}-ratelimit'
+        - Name: CommonRuleSet
+          Priority: 1
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${AWS::StackName}-common'
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  # The protocol policy lives HERE, not on the distribution's origin. Origins with
+  # VpcOriginConfig carry no CustomOriginConfig.
+  VpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Condition: IsFrontDoor
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub '${AWS::StackName}-${OwnerTag}-alb'
+        Arn: !Ref LoadBalancer
+        HTTPPort: 80
+        HTTPSPort: 443
+        OriginProtocolPolicy: https-only     # authenticate-cognito needs HTTPS
+        # CloudFormation wants a plain array here. The CLI's equivalent takes
+        # {Quantity, Items}; the two shapes are not interchangeable.
+        OriginSSLProtocols: [TLSv1.2]
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: IsFrontDoor
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} Kiro Crew dashboard'
+        Aliases: [!Ref DomainName]
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        WebACLId: !GetAtt WebAcl.Arn
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: alb
+            # DomainName is REQUIRED even for a VPC origin, and it drives SNI to the
+            # origin. It is set to the custom domain, not the ALB's DNS name, so SNI
+            # matches the ACM certificate the ALB presents - an *.elb.amazonaws.com
+            # name never could, and ACM will not issue for it. Routing is by
+            # VpcOriginId, not DNS, so pointing this at a name that resolves to
+            # CloudFront does not create a loop.
+            DomainName: !Ref DomainName
+            VpcOriginConfig:
+              VpcOriginId: !Ref VpcOrigin
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: alb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # CachingDisabled: nothing here is cacheable and a cached authenticated
+          # response would be a security bug.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # AllViewer: forwards every header including Host, Upgrade and Connection,
+          # plus all cookies. Host makes the ALB certificate match and makes the ALB
+          # build its Cognito redirect against the public domain. Upgrade/Connection
+          # are what make the dashboard's WebSocket work at all.
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+        Logging:
+          Bucket: !GetAtt LogBucket.DomainName
+          Prefix: cloudfront/
+          IncludeCookies: false
+      Tags:
+        - {Key: Project, Value: kirocrew-on-aws}
+        - {Key: Owner, Value: !Ref OwnerTag}
+        - {Key: auto-delete, Value: 'no'}
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: IsFrontDoor
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2      # fixed CloudFront zone id, not a typo
+        EvaluateTargetHealth: false
+
+Outputs:
+  StackRegion:
+    Description: Region this stack deployed into, which must be us-east-1.
+    Value: !Ref 'AWS::Region'
+  ResolvedAccessMode:
+    Description: Whether the public front door was created.
+    Value: !Ref AccessMode
+  ResolvedNetworkMode:
+    Description: Whether a VPC was created or an existing one reused.
+    Value: !Ref NetworkMode
+  StateBucketName:
+    Description: System of record for Crew's data home.
+    Value: !Ref StateBucket
+  LogBucketName:
+    Description: ALB access logs under alb/, plus S3 Files server access logs.
+    Value: !Ref LogBucket
+  AutoScalingGroupName:
+    Description: >-
+      Self-healing group holding exactly one Gateway. Resolve the live instance with:
+      aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names <this>
+      --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text
+    Value: !Ref AutoScalingGroup
+  StateKeyArn:
+    Description: CMK encrypting durable state.
+    Value: !GetAtt StateKey.Arn
+  HostSecurityGroupId:
+    Description: Security group for the Gateway host.
+    Value: !Ref HostSg
+  FileSystemSecurityGroupId:
+    Description: Security group for the S3 Files mount target.
+    Value: !Ref FsSg
+  InstanceRoleArn:
+    Description: The only identity with data access to state.
+    Value: !GetAtt InstanceRole.Arn
+  SecretsToPopulate:
+    Description: Secret names that bootstrap must fill; the stack creates them empty.
+    Value: !Sub '${ChannelSecret}, ${KiroCliSecret}, ${AuditEpochSecret}'
+  DashboardUrl:
+    Condition: IsFrontDoor
+    Description: Public HTTPS entry point, behind WAF then Cognito then Crew's own token.
+    Value: !Sub 'https://${DomainName}'
+  CognitoUserPoolId:
+    Condition: IsFrontDoor
+    Description: Create your user here; self-signup is disabled. MFA follows MfaMode.
+    Value: !Ref UserPool
+  CognitoHostedUiDomain:
+    Condition: IsFrontDoor
+    Description: Cognito hosted UI domain prefix.
+    Value: !Ref UserPoolDomain
+  DistributionId:
+    Condition: IsFrontDoor
+    Description: CloudFront distribution.
+    Value: !Ref Distribution

@@ -1,0 +1,78 @@
+{
+  "Parameters": [
+    {
+      "ParameterKey": "AccessMode",
+      "ParameterValue": "ssm-only",
+      "_comment": "front-door requires a registered domain and ONE issued ACM certificate in us-east-1, which serves both CloudFront and the ALB. ssm-only has no public endpoint and no ALB, CloudFront, WAF or Cognito cost."
+    },
+    {
+      "ParameterKey": "DomainName",
+      "ParameterValue": "",
+      "_comment": "e.g. crew.example.com. Required only for front-door."
+    },
+    {
+      "ParameterKey": "HostedZoneId",
+      "ParameterValue": "",
+      "_comment": "e.g. Z0123456789ABCDEFGHIJ. Required only for front-door."
+    },
+    {
+      "ParameterKey": "CertificateArn",
+      "ParameterValue": "",
+      "_comment": "ONE issued ACM cert in us-east-1 covering DomainName. Serves both the CloudFront viewer connection and the ALB HTTPS listener, because the template is pinned to us-east-1. A wildcard cert works. Bring your own."
+    },
+    {
+      "ParameterKey": "NetworkMode",
+      "ParameterValue": "existing",
+      "_comment": "existing reuses a VPC and its NAT, which is usually free because you already pay for them. create builds a dedicated VPC."
+    },
+    {
+      "ParameterKey": "VpcId",
+      "ParameterValue": "vpc-EXAMPLE0000000000",
+      "_comment": "Required when NetworkMode=existing."
+    },
+    {
+      "ParameterKey": "PrivateSubnetIds",
+      "ParameterValue": "subnet-EXAMPLEA00000000,subnet-EXAMPLEB00000000",
+      "_comment": "Exactly two PRIVATE subnets in distinct AZs, each with a default route to a NAT or transit gateway. deploy.sh verifies this before creating anything."
+    },
+    {
+      "ParameterKey": "VpcCidr",
+      "ParameterValue": "10.20.0.0/16",
+      "_comment": "Only used when NetworkMode=create."
+    },
+    {
+      "ParameterKey": "EgressMode",
+      "ParameterValue": "nat-instance",
+      "_comment": "Only used when NetworkMode=create. nat-instance is roughly a tenth the cost of nat-gateway and becomes infrastructure you operate."
+    },
+    {
+      "ParameterKey": "InstanceType",
+      "ParameterValue": "r8g.large",
+      "_comment": "Graviton4, 2 vCPU / 16 GiB, ~$86/mo. Best price-performance shape meeting Crew's documented RAM floor. Subagent concurrency scales with MEMORY, so r8g.xlarge (32 GiB) is the lever for wider fan-out, not more cores."
+    },
+    {
+      "ParameterKey": "ContainerImageDigest",
+      "ParameterValue": "sha256:368ff37d3d3cf82d972eeb15fba1128fc09cb78b0004ddd19c39e9d3b7a9669a",
+      "_comment": "Multi-arch index digest of ghcr.io/kirodotdev/kirocrew:stable resolved 2026-08-14. Re-resolve and re-verify with scripts/verify-image.sh before deploying; do not assume this digest is current."
+    },
+    {
+      "ParameterKey": "LogRetentionDays",
+      "ParameterValue": "30"
+    },
+    {
+      "ParameterKey": "NotificationEmail",
+      "ParameterValue": "you@example.com",
+      "_comment": "Alarm destination. Email on purpose: alarm delivery must not depend on the Gateway being healthy."
+    },
+    {
+      "ParameterKey": "OwnerTag",
+      "ParameterValue": "kirocrew",
+      "_comment": "Lowercase, digits and hyphens. Distinguishes multiple Gateways in one account; every globally unique name derives from the stack name plus this."
+    },
+    {
+      "ParameterKey": "MfaMode",
+      "ParameterValue": "ON",
+      "_comment": "ON requires TOTP. Only weaken this deliberately."
+    }
+  ]
+}
