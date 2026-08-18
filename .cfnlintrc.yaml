@@ -1,0 +1,21 @@
+templates:
+  - infra/kirocrew.yaml
+
+regions:
+  - us-east-1
+
+ignore_checks:
+  # E3006 "Resource type 'AWS::S3Files::*' does not exist in 'us-east-1'".
+  #
+  # This is a FALSE POSITIVE from cfn-lint's bundled schema snapshot, which lags
+  # newly released resource types. Verified against the live CloudFormation
+  # registry on 2026-08-16:
+  #
+  #   aws cloudformation describe-type --type RESOURCE \
+  #     --type-name AWS::S3Files::FileSystem --region us-east-1
+  #
+  # returns FULLY_MUTABLE for FileSystem, MountTarget, AccessPoint and
+  # FileSystemPolicy. Re-check this suppression after upgrading cfn-lint; once its
+  # schema catches up, delete this entry rather than leaving a blanket ignore in
+  # place, because E3006 catches genuine typos in resource type names.
+  - E3006
