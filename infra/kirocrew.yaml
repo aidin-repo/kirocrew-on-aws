@@ -12,7 +12,7 @@ Metadata:
       - Label: {default: Network}
         Parameters: [NetworkMode, VpcId, PrivateSubnetIds, EgressMode, VpcCidr]
       - Label: {default: Compute}
-        Parameters: [InstanceType, ContainerImageDigest]
+        Parameters: [InstanceType, ContainerImageDigest, SeccompProfileCommit, SeccompProfileSha256]
       - Label: {default: Operations}
         Parameters: [LogRetentionDays, NotificationEmail, OwnerTag]
     ParameterLabels:
@@ -116,20 +116,34 @@ Parameters:
 
   ContainerImageDigest:
     Type: String
-    Default: sha256:368ff37d3d3cf82d972eeb15fba1128fc09cb78b0004ddd19c39e9d3b7a9669a
+    Default: sha256:b6d0b9a3a666df30d99fcadc6a71ab83cbf4ed1c6521e1b81f0333c5553f3e90
     AllowedPattern: '^sha256:[0-9a-f]{64}$'
     Description: >-
       Multi-arch index digest of ghcr.io/kirodotdev/kirocrew. Pin the index
       digest, not a per-architecture digest, so one value works on any
       architecture. Verify provenance with scripts/verify-image.sh before deploy.
 
+  SeccompProfileCommit:
+    Type: String
+    Default: 41987ae89b9456868f6d93d3cbe36f94a1fc3635
+    AllowedPattern: '^[0-9a-f]{40}$'
+    Description: >-
+      Full upstream commit SHA that SeccompProfileSha256 was computed at. Boot
+      fetches the profile from this immutable commit, NOT from the main branch.
+      An earlier version of this template fetched from main, so when upstream
+      revised the profile (2026-10-21, umount2 allow) every host launched after
+      that failed closed at boot with a digest mismatch, which silently broke
+      self-healing. Pinning the commit makes the pair (commit, sha256)
+      reproducible until you choose to move both together.
+
   SeccompProfileSha256:
     Type: String
-    Default: b49d7ad01079965aad587afce24be6c9a6aec0e52d5e96303a15c64ea8226fab
+    Default: 27171ba355b5ff0d08d8e72e6246b8a9b7f367592b7ff8fa1ed560d7e1c31d30
     AllowedPattern: '^[0-9a-f]{64}$'
     Description: >-
-      SHA256 of upstream docker/seccomp/kirocrew-seccomp.json, which Crew's agent
-      sandbox requires. Boot fetches that file and refuses to continue if the
+      SHA256 of upstream docker/seccomp/kirocrew-seccomp.json at
+      SeccompProfileCommit, which Crew's agent sandbox requires. Boot fetches
+      that file and refuses to continue if the
       digest differs, so a change upstream fails closed rather than silently
       loosening a security control. If upstream revises the profile, verify the
       new file and update this value.
@@ -1189,7 +1203,7 @@ Resources:
               mkdir -p /etc/crew
               for attempt in 1 2 3 4 5; do
                 curl -fsSL --max-time 30 \
-                  https://raw.githubusercontent.com/kirodotdev/KiroCrew/main/docker/seccomp/kirocrew-seccomp.json \
+                  https://raw.githubusercontent.com/kirodotdev/KiroCrew/${SeccompProfileCommit}/docker/seccomp/kirocrew-seccomp.json \
                   -o "$SECCOMP" && break
                 echo "seccomp fetch attempt $attempt failed; retrying in 5s"
                 sleep 5

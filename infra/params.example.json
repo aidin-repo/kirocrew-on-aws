@@ -52,7 +52,7 @@
     },
     {
       "ParameterKey": "ContainerImageDigest",
-      "ParameterValue": "sha256:368ff37d3d3cf82d972eeb15fba1128fc09cb78b0004ddd19c39e9d3b7a9669a",
+      "ParameterValue": "sha256:b6d0b9a3a666df30d99fcadc6a71ab83cbf4ed1c6521e1b81f0333c5553f3e90",
       "_comment": "Multi-arch index digest of ghcr.io/kirodotdev/kirocrew:stable resolved 2026-08-14. Re-resolve and re-verify with scripts/verify-image.sh before deploying; do not assume this digest is current."
     },
     {

@@ -10,6 +10,17 @@ need — no CDK bootstrap, no build toolchain.
 compute are all in the template and exercised against a live account. Recovery from instance
 termination is measured at 134 seconds with no human involvement.
 
+## Two ways to host it
+
+| | What it is | Use it when |
+|---|---|---|
+| **Option A: this README** | One shared Gateway on EC2 with S3-backed state, self-healing and an optional Cognito front door | One person or one team identity owns the Gateway |
+| **[Option B: `option-b-eks-per-user/`](option-b-eks-per-user/README.md)** | One Kiro Crew pod per user on EKS, behind Cognito and a per-pod auth proxy (CDK, proof of concept) | Each person needs their own Kiro sign-in and their own Jira and MCP credentials |
+
+Kiro Crew itself also ships a one-command EC2 launcher, `kirocrew cloud launch`. It is the quickest way to try Crew on
+AWS: one instance, state on its own disk, reached over SSM. This repository is for when the Gateway has to survive
+losing its host.
+
 ## What you get
 
 - **An always-on Gateway.** Cron jobs fire, long tasks finish, Slack and Discord connections stay
